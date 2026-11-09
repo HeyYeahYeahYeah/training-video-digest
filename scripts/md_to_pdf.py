@@ -8,11 +8,16 @@ md_to_pdf.py — 把「带界面截图」的 Markdown 渲染成 A4 PDF（Chrome/
     因为 HTML 必须在系统临时 ASCII 目录构建以规避中文路径问题，
     不内嵌的话所有截图在 PDF 里都会变成裂图。
 
-用法: python md_to_pdf.py <input.md> <output.pdf>
-退出码: 0 成功 / 1 输入缺失 / 2 参数错 / 3 无浏览器 / 4 打印失败
+用法: python md_to_pdf.py <input.md> <output.pdf> [--allow-install]
+      python md_to_pdf.py --check
+退出码: 0 成功 / 1 输入缺失 / 2 参数错 / 3 无浏览器 / 4 打印失败 / 5 缺少依赖
+
+权限约定：默认绝不执行 pip install；缺 markdown 时打印安装命令后退出。
+只有显式传 --allow-install（使用者已明确同意）才会安装。
 """
 import base64
 import importlib.util
+import json
 import mimetypes
 import os
 import re
@@ -23,14 +28,30 @@ import tempfile
 import urllib.parse
 
 
-def ensure_markdown():
-    if importlib.util.find_spec("markdown") is None:
+def require_markdown(allow_install=False):
+    """默认不自动安装。缺依赖时给出明确命令并退出，由使用者决定是否执行。"""
+    if importlib.util.find_spec("markdown") is not None:
+        import markdown  # noqa
+        return markdown
+    hint = ("缺少 Python 包 markdown。请先征得使用者同意，再执行：\n"
+            "    python -m pip install markdown\n"
+            "若已获同意，也可给本脚本加 --allow-install 让它代装。")
+    if not allow_install:
+        print("ERR: " + hint, file=sys.stderr)
+        sys.exit(5)
+    try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "markdown"])
+    except Exception as e:
+        print("ERR: 自动安装失败 (%s)。%s" % (e, hint), file=sys.stderr)
+        sys.exit(5)
     import markdown  # noqa
     return markdown
 
 
 def find_browser():
+    env = os.environ.get("BROWSER_BIN") or os.environ.get("CHROME_BIN")
+    if env and os.path.isfile(env):
+        return env
     candidates = [
         os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
         os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
@@ -133,23 +154,71 @@ def inline_images(text, md_dir):
     return IMG_RE.sub(repl, text), ok, failed
 
 
+def cleanup_workdir(workdir):
+    """只清理本脚本在 tempfile.mkdtemp 里自建的内容，不触碰任何其它目录。
+
+    不用递归删除：逐个删掉自己写出的文件与 Chrome 临时 profile 里的文件，
+    再逐级 rmdir 空目录。删不掉的残留交给系统临时目录自行回收。
+    """
+    profile = os.path.join(workdir, "profile")
+    if os.path.isdir(profile):
+        for root, dirs, files in os.walk(profile, topdown=False):
+            for f in files:
+                try:
+                    os.remove(os.path.join(root, f))
+                except OSError:
+                    pass
+            for d in dirs:
+                try:
+                    os.rmdir(os.path.join(root, d))
+                except OSError:
+                    pass
+        try:
+            os.rmdir(profile)
+        except OSError:
+            pass
+    for name in ("doc.html", "out.pdf"):
+        p = os.path.join(workdir, name)
+        if os.path.isfile(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    try:
+        os.rmdir(workdir)
+    except OSError:
+        pass
+
+
 def main():
-    if len(sys.argv) < 3:
-        print("usage: md_to_pdf.py <input.md> <output.pdf>", file=sys.stderr)
+    allow_install = "--allow-install" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if "--check" in sys.argv:
+        print(json.dumps({
+            "browser": find_browser(),
+            "markdown": bool(importlib.util.find_spec("markdown")),
+            "Pillow": bool(importlib.util.find_spec("PIL")),
+            "python": sys.version.split()[0],
+        }, ensure_ascii=False, indent=2))
+        return
+    if len(args) < 2:
+        print("usage: md_to_pdf.py <input.md> <output.pdf> [--allow-install]\n"
+              "       md_to_pdf.py --check", file=sys.stderr)
         sys.exit(2)
 
-    md_path = os.path.abspath(sys.argv[1])
-    pdf_path = os.path.abspath(sys.argv[2])
+    md_path = os.path.abspath(args[0])
+    pdf_path = os.path.abspath(args[1])
     if not os.path.isfile(md_path):
         print("ERR: markdown not found: %s" % md_path, file=sys.stderr)
         sys.exit(1)
 
     browser = find_browser()
     if not browser:
-        print("ERR: no Chrome/Edge/chromium found", file=sys.stderr)
+        print("ERR: 找不到 Chrome/Edge/Chromium。可设置 BROWSER_BIN 环境变量指向可执行文件。",
+              file=sys.stderr)
         sys.exit(3)
 
-    markdown = ensure_markdown()
+    markdown = require_markdown(allow_install)
     with open(md_path, encoding="utf-8") as f:
         text = f.read()
 
@@ -193,7 +262,7 @@ def main():
         shutil.copyfile(tmp_pdf, pdf_path)
         print("OK: %s (%d bytes, %d images)" % (pdf_path, os.path.getsize(pdf_path), n_img))
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+        cleanup_workdir(workdir)
 
 
 if __name__ == "__main__":

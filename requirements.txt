@@ -1,0 +1,15 @@
+# 必需依赖
+#   python -m pip install -r requirements.txt
+Pillow>=9.0
+markdown>=3.4
+
+# ---- 以下均为可选，按需自行安装；脚本绝不会自动安装 ----
+# 本地转写（推荐 CPU 使用，安装前请确认是否允许下载模型权重）
+# faster-whisper>=1.0
+# 或：openai-whisper>=20231117
+#
+# OCR 文字线索（还需系统安装 tesseract-ocr 及 chi_sim 语言包）
+# 本仓库脚本直接调用 tesseract 命令行，不依赖 pytesseract
+#
+# 校验 PDF 页数/文字（仅验收时用）
+# pypdf>=4.0

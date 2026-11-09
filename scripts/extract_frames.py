@@ -3,16 +3,24 @@
 """
 extract_frames.py — 培训录屏截图引擎（环境自检 / 操作节点候选 / 精确截帧）
 
-三种模式，互斥：
+四种模式，互斥：
+  --check
+      只读探测依赖（ffmpeg / ffprobe / Pillow），不写文件、不联网、不安装。
   --probe <video>
-      环境自检 + 视频体检，输出 JSON。
+      视频体检，输出 JSON。
   --candidates --video <v> --transcript <t.md> --out <manifest.json>
       语言锚点 + ffmpeg 场景检测 → 合并去重 → 候选清单。
   --extract --video <v> --manifest <manifest.json> --frames <dir>
       按清单精确截帧 + 压缩，回写 manifest 的 file 字段。
 
-可选参数：--min-gap 12 --max-frames 36 --threshold 0.25 --no-scene
+逐字稿格式：接受 [HH:MM:SS]、SRT/VTT 行、以及 [起,止,说话人] 段格式；
+也可由 transcribe.py 产出（文件头带 <!-- transcript.mode: A|B -->，本脚本优先采信）。
+
+可选参数：--min-gap 12 --max-frames 0 --threshold 0.25 --no-scene
 退出码：0 成功 / 1 输入缺失 / 2 ffmpeg 或视频不可用 / 3 参数错
+
+权限约定：不联网、不自动安装、不改动机上任何既有文件；
+临时原图建在本脚本创建的 _raw 子目录，结束时只删除自己刚写的文件。
 """
 import argparse
 import json
@@ -25,13 +33,21 @@ import sys
 # ---------------------------------------------------------------- 基础工具
 
 FFMPEG_HINTS = [
-    # ffmpeg 不在 PATH 时，把本机实际安装路径按下面格式补进列表
+    # ffmpeg 不在 PATH 时，可设置 FFMPEG_BIN 环境变量，或把路径按下面格式补进列表
+    os.environ.get("FFMPEG_BIN", ""),
     r"C:\ffmpeg\bin\ffmpeg.exe",
     r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
     r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
     os.path.expandvars(r"%LocalAppData%\Microsoft\WinGet\Links\ffmpeg.exe"),
+    "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg",
 ]
-FFPROBE_HINTS = [p.replace("ffmpeg.exe", "ffprobe.exe") for p in FFMPEG_HINTS]
+def _ffprobe_from(p):
+    """只替换文件名，不动路径里的 ffmpeg 目录名。"""
+    d, n = os.path.split(p)
+    return os.path.join(d, n.replace("ffmpeg", "ffprobe")) if d else n.replace("ffmpeg", "ffprobe")
+
+
+FFPROBE_HINTS = [os.environ.get("FFPROBE_BIN", "")] + [_ffprobe_from(p) for p in FFMPEG_HINTS if p]
 
 
 def find_bin(name, hints):
@@ -72,8 +88,8 @@ TS_PATTERNS = [
 ]
 
 
-# 内置 AudioTranscribe 的原生段格式：
-#   [0:1.320,0:11.120,0]        分:秒.毫秒, 结束, 说话人
+# 某些 ASR 服务/工具会输出段级格式：
+#   [0:1.320,0:11.120,0]         分:秒.毫秒, 结束, 说话人
 #   [1:23:45.120,1:23:50.000,0] 时:分:秒.毫秒, 结束, 说话人
 # 必须优先于 TS_PATTERNS 判定，否则会被误判为「无时间戳」走估算模式。
 ATR_SEG_RE = re.compile(
@@ -155,8 +171,9 @@ def probe(video, ffmpeg, ffprobe):
         "audio_codec": auds[0].get("codec_name") if auds else None,
         "ffmpeg": ffmpeg,
         "ffprobe": ffprobe,
-        "within_transcribe_limit": dur <= 5 * 3600 and
-                                   int(info.get("format", {}).get("size") or 0) <= 1024 ** 3,
+        # 仅作提示：超过时建议按小时切片，避免单次处理过慢；不是硬性上限。
+        "suggest_split": dur > 5 * 3600 or
+                         int(info.get("format", {}).get("size") or 0) > 1024 ** 3,
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
@@ -191,9 +208,13 @@ def build_candidates(video, transcript, out, ffmpeg, ffprobe,
         sys.exit(2)
 
     with open(transcript, encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
-    full = "".join(lines)
+        raw = f.read()
+    lines = raw.splitlines(True)
+    full = raw
     n_chars = max(1, len(full))
+    # transcribe.py 会在文件头声明模式；优先采信，避免字幕行数少时被误判成 B。
+    declared = re.search(r"<!--\s*transcript\.mode:\s*([AB])\s*-->", raw)
+    source_m = re.search(r"<!--\s*transcript\.source:\s*([^>]+?)\s*-->", raw)
 
     # 切成语义片段：有时间戳的行直接用；无时间戳的行按中文标点拆句，
     # 再按「累计字符偏移 / 全文字符数 × 时长」估算时间。
@@ -222,7 +243,11 @@ def build_candidates(video, transcript, out, ffmpeg, ffprobe,
                 segments.append((sent, (mid / n_chars) * dur, False))
         offset += len(line)
 
-    timestamp_mode = "A" if ts_seen >= max(3, len(lines) * 0.1) else "B"
+    if declared:
+        # 声明 A 但一个时间戳都没解析出来 → 数据不一致，按更保守的 B 处理
+        timestamp_mode = "A" if (declared.group(1) == "A" and ts_seen > 0) else "B"
+    else:
+        timestamp_mode = "A" if ts_seen >= max(3, len(lines) * 0.1) else "B"
 
     lang_hits = []      # (ts, reason, context, exact?)
     for text, ts, exact in segments:
@@ -240,14 +265,24 @@ def build_candidates(video, transcript, out, ffmpeg, ffprobe,
     if use_scene and info["has_video"]:
         scenes, scene_ok = scene_times(video, ffmpeg, threshold)
 
-    # 语言锚点优先；若 ±8s 内有画面切换，吸附到切换后 1.5s（避开转场模糊帧）
+    # 语言锚点优先。只有 ±2s 内确有画面切换才吸附到切换后 1.5s（避开转场模糊帧）；
+    # 且同一个场景点只服务一个锚点，否则多个不同时刻的讲解会被挤成同一个截帧点。
+    # 早期版本用 ±8s 且不去重场景点，短视频/场景点稀疏时会把全部锚点吸成一张，已修正。
+    SNAP_WINDOW = 2.0
+    snapped = set()
     merged = []
     for ts, reason, ctx, exact in lang_hits:
-        near = [s for s in scenes if abs(s - ts) <= 8]
-        use_ts = min(near, key=lambda s: abs(s - ts)) + 1.5 if near else ts
+        near = [s for s in scenes if abs(s - ts) <= SNAP_WINDOW]
+        use_ts, source = ts, "language"
+        if near:
+            scene = min(near, key=lambda s: abs(s - ts))
+            key = round(scene, 1)
+            if key not in snapped:
+                snapped.add(key)
+                use_ts, source = scene + 1.5, "language+scene"
         merged.append({
             "ts": round(min(use_ts, dur - 1), 2),
-            "source": "language+scene" if near else "language",
+            "source": source,
             "reason": reason,
             "context": ctx,
             "exact": exact,
@@ -265,7 +300,7 @@ def build_candidates(video, transcript, out, ffmpeg, ffprobe,
                     "context": "",
                     "exact": True,
                 })
-                used.append(s)
+                used.append(s + 1.5)
             if len(merged) >= max_frames * 2:
                 break
 
@@ -293,9 +328,11 @@ def build_candidates(video, transcript, out, ffmpeg, ffprobe,
         "duration_sec": dur,
         "timestamp_mode": timestamp_mode,
         "transcript_format": (
-            "AudioTranscribe 原生段格式 [起,止,说话人]，时间戳精确"
-            if speakers else "通用逐字稿"
+            "段级格式 [起,止,说话人]，含说话人分离" if speakers else
+            ("带时间戳逐字稿（transcribe.py 或字幕导入）" if timestamp_mode == "A"
+             else "纯文本逐字稿（无时间戳）")
         ),
+        "transcript_source": source_m.group(1) if source_m else "unspecified",
         "speakers": speakers,
         "timestamp_note": (
             "逐字稿含段级时间戳，文档时间戳可直接跳转" if timestamp_mode == "A" else
@@ -322,15 +359,18 @@ def build_candidates(video, transcript, out, ffmpeg, ffprobe,
 def extract(video, manifest_path, frames_dir, ffmpeg):
     with open(manifest_path, encoding="utf-8") as f:
         mf = json.load(f)
-    os.makedirs(frames_dir, exist_ok=True)
-    os.makedirs(os.path.join(frames_dir, "_raw"), exist_ok=True)
+    raw_dir = os.path.join(frames_dir, "_raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    # 只记录本脚本本次写出的原图，结束时逐个删除；不递归删除任何目录。
+    raw_files = []
+    frames_rel = os.path.basename(os.path.normpath(frames_dir)) or "_frames"
 
     kept = [c for c in mf["candidates"] if c.get("keep", True)]
     done = 0
     for c in kept:
         name = "%03d_%s.jpg" % (c["i"], compact_hhmmss(c["ts"]))
         final = os.path.join(frames_dir, name)
-        raw = os.path.join(frames_dir, "_raw", name)
+        raw = os.path.join(raw_dir, name)
         r = run([
             ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
             "-ss", "%.3f" % c["ts"], "-i", video,
@@ -340,6 +380,7 @@ def extract(video, manifest_path, frames_dir, ffmpeg):
             print("WARN: 截帧失败 ts=%s %s" % (c["ts"], (r.stderr or "")[-200:]), file=sys.stderr)
             c["file"] = None
             continue
+        raw_files.append(raw)
         try:
             from PIL import Image
             with Image.open(raw) as im:
@@ -350,11 +391,19 @@ def extract(video, manifest_path, frames_dir, ffmpeg):
                 im.save(final, "JPEG", quality=82, optimize=True)
         except Exception:
             shutil.copyfile(raw, final)
-        c["file"] = "_frames/" + name
+        c["file"] = frames_rel + "/" + name
         c["bytes"] = os.path.getsize(final)
         done += 1
 
-    shutil.rmtree(os.path.join(frames_dir, "_raw"), ignore_errors=True)
+    for p in raw_files:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    try:
+        os.rmdir(raw_dir)   # 仅当目录已空才成功；不会动任何其它文件
+    except OSError:
+        pass
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(mf, f, ensure_ascii=False, indent=2)
     print("EXTRACTED: %d / %d 张 → %s" % (done, len(kept), frames_dir), file=sys.stderr)
@@ -365,6 +414,8 @@ def extract(video, manifest_path, frames_dir, ffmpeg):
 
 def main():
     ap = argparse.ArgumentParser(description="培训录屏截图引擎")
+    ap.add_argument("--check", action="store_true",
+                    help="只读探测依赖，不联网、不安装、不写文件")
     ap.add_argument("--probe", metavar="VIDEO", help="环境自检 + 视频体检")
     ap.add_argument("--candidates", action="store_true", help="生成操作节点候选清单")
     ap.add_argument("--extract", action="store_true", help="按清单精确截帧")
@@ -382,8 +433,21 @@ def main():
 
     ffmpeg = find_bin("ffmpeg", FFMPEG_HINTS)
     ffprobe = find_bin("ffprobe", FFPROBE_HINTS)
+
+    if a.check:
+        import importlib.util
+        print(json.dumps({
+            "ffmpeg": ffmpeg,
+            "ffprobe": ffprobe,
+            "ffmpeg_ready": bool(ffmpeg and ffprobe),
+            "Pillow": bool(importlib.util.find_spec("PIL")),
+            "markdown": bool(importlib.util.find_spec("markdown")),
+            "python": sys.version.split()[0],
+        }, ensure_ascii=False, indent=2))
+        return
     if not ffmpeg:
-        print("ERR: ffmpeg not found. Add its path to FFMPEG_HINTS in this script.", file=sys.stderr)
+        print("ERR: ffmpeg not found. Install ffmpeg, put it on PATH, "
+              "or set the FFMPEG_BIN environment variable.", file=sys.stderr)
         sys.exit(2)
 
     if a.probe:

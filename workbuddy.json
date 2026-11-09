@@ -1,6 +1,0 @@
-{
-  "display_name": "培训录屏图文纪要 Training Video Digest",
-  "display_name_en": "Training Video Digest (notes + screenshots)",
-  "description_zh": "Training Video Digest｜把本地软件操作培训录屏整理成带界面截图的图文对照纪要：长视频转写、按操作节点截屏、要点带时间戳并配图，产出 md + pdf。适用于远程会议录屏、虚拟仿真软件演示、甲方培训留档。",
-  "description_en": "Turn a local software-training screen recording into an illustrated digest: long-video transcription, key-frame screenshots at operation points, timestamped takeaways with embedded images, delivered as Markdown + PDF. For remote meeting recordings, simulation software demos, and client-side training archives."
-}
